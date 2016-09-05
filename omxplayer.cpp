@@ -1226,17 +1226,22 @@ int main(int argc, char *argv[])
         //! will continue thru the packet looking for lines after each new-line
         //! character.  i.e. There may be clock data on later lines in the packet.
         //! But, as soon as clock data is found in a packet, there will not be
-        //! more clock data for the same clock name in that packet.
+        //! more clock data for the same clock name in that packet.  Also, in the
+        //! LHSG software, if the first 5 characters of a packet are 'file ', then
+        //! the rest of the packet is binary data.  If that is detected, then the
+        //! packet can be immediately discarded.
         
         //! Pythonic pseudo-code:
         // received_time_index = None
         // for packet in udp_port.recvfrom():
+          // if packet[:5] == 'file ':
+            // continue
           // for line in packet.readlines():
             // if line[:6] != 'clock ':
               // continue
-            // if line.split()[1] != stored_clock_name:
+            // if line.split(' ', 2)[1] != stored_clock_name:
               // continue
-            // received_time_index = int(line.split()[2] * 1000000)
+            // received_time_index = int(line.split(' ', 2)[2] * 1000000)
             // break
         
         //! If we received an update, we now need to quickly snapshot the
