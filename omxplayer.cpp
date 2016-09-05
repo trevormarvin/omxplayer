@@ -17,6 +17,18 @@
  * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
+/*
+The purpose of this fork is to bake into the player a synchronization method
+that allows multiple players to lock together.  One player is invoked as the
+master and will broadcast UDP packets that contain its current playback
+position, and one or more players can received these packets and synchonize
+their playback to it.  -- Trevor Marvin
+
+This space reserved for the colleague who is the C++ guru who will write the
+actual code for this implementation.
+
+*/
+
 #include <stdio.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -27,6 +39,9 @@
 #include <sys/ioctl.h>
 #include <getopt.h>
 #include <string.h>
+#include <sys/types.h>   // LHSG
+#include <sys/socket.h>  // LHSG
+#include <netinet/in.h>  // LHSG
 
 #define AV_NOWARN_DEPRECATED
 
@@ -169,6 +184,16 @@ void print_usage()
   printf("              --video_fifo  n           Size of video output fifo in MB\n");
   printf("              --audio_queue n           Size of audio input queue in MB\n");
   printf("              --video_queue n           Size of video input queue in MB\n");
+  printf("              --txsyncclk clock_name,broadcast_addr,udp_port    Transmit the playback clock\n");
+  // LHSG extension: the arguments are a text clock name that's put in the broadcast
+  // packets, the broadcast address to send to (e.g. "192.168.0.255"), and the UDP port
+  // number to broadcast to.
+  printf("              --rxsyncclk clock_name,udp_port,applied_offset    Sync to received playback clock\n");
+  // LHSG extension: the arguments are the text clock name to scan for (allowing
+  // other players to broadcast on the same port and have the clock data discriminated),
+  // the UDP port number to bind to (presumably on the "0.0.0.0" interface, and
+  // an offset in seconds (floating point) to apply to the clock data received
+  // to allow for tweaking the synchonization.
 }
 
 void print_keybindings()
@@ -343,11 +368,11 @@ void SetVideoMode(int width, int height, int fpsrate, int fpsscale, FORMAT_3D_T 
 
       /* Check if frame rate match (equal or exact multiple) */
       if(fabs(r - 1.0f*fps) / fps < 0.002f)
-	score += 0;
+        score += 0;
       else if(fabs(r - 2.0f*fps) / fps < 0.002f)
-	score += 1<<8;
+        score += 1<<8;
       else 
-	score += (1<<28)/r; // bad - but prefer higher framerate
+        score += (1<<28)/r; // bad - but prefer higher framerate
 
       /* Check size too, only choose, bigger resolutions */
       if(width && height) 
@@ -468,7 +493,7 @@ int main(int argc, char *argv[])
   }
   atexit(restore_term);
 
-  std::string            m_filename;
+  std::string           m_filename;
   double                m_incr                = 0;
   CRBP                  g_RBP;
   COMXCore              g_OMX;
@@ -484,6 +509,17 @@ int main(int argc, char *argv[])
   float video_queue_size = 0.0;
   bool has_buffered = false;
   TV_DISPLAY_STATE_T   tv_state;
+  
+  // variables for the LHSG sync extensions
+  char          SyncClockName[64];   // the name of the clock to send or discriminate for
+  std::string   BcstAddress;  // the network broadcast address, TX mode
+  float         SyncOffset = 0.0;  // an offset to apply to clock data received
+    //! the above varable could be stored as a signed integer of microseconds,
+    //! as microseconds appear to be the native format for the data coming out of the player
+  int           ExtSync = 0;   // switching variable to store the mode selected
+                              // 0 if not enabled, 1 if TX sync, 2 if RX sync
+  int           SyncSocketFD, UDPPort;  // file-desc# for network port, and UDP port number
+  struct sockaddr_in    SyncSocket;  // address for the network port
 
   const int font_opt        = 0x100;
   const int font_size_opt   = 0x101;
@@ -527,6 +563,11 @@ int main(int argc, char *argv[])
     { "audio_queue",  required_argument,  NULL,          audio_queue_opt },
     { "video_queue",  required_argument,  NULL,          video_queue_opt },
     { "boost-on-downmix", no_argument,    NULL,          boost_on_downmix_opt },
+    { "txsyncclk",    required_argument,  NULL,          txsyncclk_opt },
+    // LHSG extension, transmit sync clock, presuming all the args come as a
+    // single string with no spaces, like the "win" or "crop" args
+    { "rxsyncclk",    required_argument,  NULL,          rxsyncclk_opt },
+    // LHSG extension, receive sync clock
     { 0, 0, 0, 0 }
   };
 
@@ -621,25 +662,25 @@ int main(int argc, char *argv[])
         m_subtitle_lines = std::max(atoi(optarg), 1);
         break;
       case pos_opt:
-	sscanf(optarg, "%f %f %f %f", &DestRect.x1, &DestRect.y1, &DestRect.x2, &DestRect.y2);
+        sscanf(optarg, "%f %f %f %f", &DestRect.x1, &DestRect.y1, &DestRect.x2, &DestRect.y2);
         break;
       case vol_opt:
-	m_initialVolume = atoi(optarg);
+        m_initialVolume = atoi(optarg);
         break;
       case boost_on_downmix_opt:
         m_boost_on_downmix = true;
         break;
       case audio_fifo_opt:
-	audio_fifo_size = atof(optarg);
+        audio_fifo_size = atof(optarg);
         break;
       case video_fifo_opt:
-	video_fifo_size = atof(optarg);
+        video_fifo_size = atof(optarg);
         break;
       case audio_queue_opt:
-	audio_queue_size = atof(optarg);
+        audio_queue_size = atof(optarg);
         break;
       case video_queue_opt:
-	video_queue_size = atof(optarg);
+        video_queue_size = atof(optarg);
         break;
       case 0:
         break;
@@ -653,6 +694,18 @@ int main(int argc, char *argv[])
         break;
       case ':':
         return 0;
+        break;
+      case txsyncclk_opt:  // LHSG
+        sscanf(optarg, "%s %s %d", &SyncClockName, &BcstAddress, &UDPPort);
+        ExtSync = 1  // store the sync mode
+        //! verify unpacking of the clock name, broadcast address, and UDP port number above
+        break;
+      case rxsyncclk_opt:  // LHSG
+        sscanf(optarg, "%s %d %f", &SyncClockName, &UDPPort, &SyncOffset);
+        ExtSync = 2  // store the sync mode
+        //! verify unpacking of the clock name, UDP port number, and offset above
+        //! the SyncOffset may need to be massaged to the signed integer of microseconds
+        //! as described above
         break;
       default:
         return 0;
@@ -780,6 +833,10 @@ int main(int argc, char *argv[])
         printf("Seeking start of video to %i seconds\n", m_seek_pos);
         m_omx_reader.SeekTime(m_seek_pos * 1000.0f, 0, &startpts);  // from seconds to DVD_TIME_BASE
   }
+
+  //! If the player cannot seek, as determined by the "m_omx_reader.CanSeek()" above,
+  //! then warn the user of such by outputing text.  Because of such, the player
+  //! can only change playback speed or pause to sync.
   
   if(m_has_video && !m_player_video.Open(m_hints_video, m_av_clock, DestRect, m_Deinterlace,  m_bMpeg,
                                          m_hdmi_clock_sync, m_thread_player, m_display_aspect, video_queue_size, video_fifo_size))
@@ -843,6 +900,36 @@ int main(int argc, char *argv[])
                                          m_boost_on_downmix, m_thread_player, audio_queue_size, audio_fifo_size))
     goto do_exit;
 
+  if(ExtSync){
+    //! create the socket and fault/exit out if it can't be done
+    if ((SyncSocket = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+      printf("cannot create clock socket\n");
+      goto do_exit;
+      }
+    
+    //! might as well bind the TX/sender to the same port as everyone else,
+    //! we'll just ignore all data that comes in
+    memset((char *)&SyncSocket, 0, sizeof(SyncSocket));
+    SyncSocket.sin_family = AF_INET;
+    SyncSocket.sin_addr.s_addr = htonl(INADDR_ANY);
+    SyncSocket.sin_port = htons(UDPPort);
+
+    int SocketEnable = 1;
+        //! enable broadcasting, most Linux/Posix requires that it's specifically
+        //! enabled
+    int ret = setsockopt(SyncSocketFD, SOL_SOCKET, SO_BROADCAST, &SocketEnable, sizeof(SocketEnable));
+        //! enable reuse of the port so others can bind to it too,
+        //! the will probably be other processes listening to this port on the
+        //! same machines, as the control software designed by the original
+        //! idea man for this has multiple programs listening on the same port
+    int ret = setsockopt(SyncSocketFD, SOL_SOCKET, SO_REUSEPORT, &SocketEnable, sizeof(SocketEnable));
+    
+    if (bind(SyncSocketFD, (struct sockaddr *)&SyncSocket, sizeof(SyncSocket)) < 0) {
+      printf("bind to socket failed");
+      goto do_exit;
+      }
+  }
+  
   m_av_clock->SetSpeed(DVD_PLAYSPEED_NORMAL);
   m_av_clock->OMXStart(0.0);
   m_av_clock->OMXPause();
@@ -1067,13 +1154,177 @@ int main(int argc, char *argv[])
     if(m_stats)
     {
       static int count;
+      //! This is the section for 'stats' mode, where the program will output
+      //! the current position of playback, along with other data.  The "count++ & 15"
+      //! appears to be the mechanism to throttle the output of the stats.
       if ((count++ & 15) == 0)
          printf("V : %8.02f %8d %8d A : %8.02f %8.02f/%8.02f Cv : %8d Ca : %8d                            \r",
              m_av_clock->OMXMediaTime(), m_player_video.GetDecoderBufferSize(), m_player_video.GetDecoderFreeSpace(),
              m_player_audio.GetCurrentPTS() / DVD_TIME_BASE - m_av_clock->OMXMediaTime() * 1e-6, m_player_audio.GetDelay(), m_player_audio.GetCacheTotal(),
              m_player_video.GetCached(), m_player_audio.GetCached());
-    }
+    }  //! In the above code, "m_av_clock->OMXMediaTime()" appears to be where this
+       //! top file gets the data from the player to display.  I think this is what
+       //! I'm seeing on my player as integer micro-seconds, but the print formatting
+       //! line does not appear the same as the compiled player I have.
 
+    
+    char SyncBuffer[2048];  // somewhere to stash incoming UDP packets
+    char *SyncBufPtr;
+    const char SyncKW = 'clock ';  // a keyword to scan for in the packets
+    size_t SyncBufferLen;
+    ssize_t SyncBufferResult;
+    int SyncRXFlags, SyncRXLen, SyncCurSpeed = 0;
+    struct sockaddr SyncAddr;
+    static int SyncCount;
+    unsigned long long SyncCurTime;
+    
+    //! this tests for the mode we're in
+    if((ExtSync == 1) {        // LHSG sync code for TX
+      
+      //! need to clean out the incoming network socket, but ignore anything in there
+      while ((SyncBufferResult = recvfrom(SyncSocketFD, *SyncBuffer, 2048)) != 0){}
+      
+      //! Throttle the packet transmission, aiming for about once a second.
+      //! Based on the 'stats' section, this should hopefully be close.
+      if (count & 63 == 0)) {
+      
+        //! store the current time in a variable
+        SyncCurTime = m_av_clock->OMXMediaTime();   // get the current time
+        //! create/initial the buffer for the text packet to send
+        //! put the text 'clock ' into the buffer
+        //! put the name of the clock (passed on the command line) into the buffer
+        //! add another space
+        //! massage the current time variable into a text decimal number, then into the buffer
+        //! put the new-line character into the buffer
+        //! the final string should look something like this:
+          //! "clock videoplay1 90.154\n"
+          //! in the above example, "videoplay1" is the name of the clock
+          //! and the time is 0:01:30.154
+
+        /*
+        SyncBufferLen = 0;           // buffer back to zero length
+        SyncBufPtr = &SyncBuffer;    // buffer pointer to the top address
+        strcpy(SyncBufPtr, *SyncKW, sizeof(SyncKW));   // copy "clock " keyword into packet
+        strcpy(SyncBufPtr, *SyncClockName, SyncClkNameLen);  // copy clock name
+        &SyncBufPtr = ' '; SyncBufPtr++;  // append a space
+        */
+        
+        //! send the buffer to the broadcast address and specified port number
+        sendto(SyncSocketFD, *SyncBuffer, (SyncBufPtr - *SyncBuffer), 0, *BcstAddress, BcstAddressLen)
+
+    }}
+          
+    if(ExtSync == 2) {        // LHSG sync code for RX, look for new packets
+      if ((SyncRXLen = recvfrom(SyncSocketFD, *SyncBuffer, 2048) > 0)) {
+      
+        //! While there are packets to be received, we will keep receiving them
+        //! and looking for clock data.  Any clock value we receive after another
+        //! one will over-write the previous value. i.e. will keep the last one we received.
+        
+        //! For compatibility with another system, any line that does not have
+        //! the key word "clock" at the beginning of it will be ignored, and we
+        //! will continue thru the packet looking for lines after each new-line
+        //! character.  i.e. There may be clock data on later lines in the packet.
+        //! But, as soon as clock data is found in a packet, there will not be
+        //! more clock data for the same clock name in that packet.
+        
+        //! Pythonic pseudo-code:
+        // received_time_index = None
+        // for packet in udp_port.recvfrom():
+          // for line in packet.readlines():
+            // if line[:6] != 'clock ':
+              // continue
+            // if line.split()[1] != stored_clock_name:
+              // continue
+            // received_time_index = int(line.split()[2] * 1000000)
+            // break
+        
+        //! If we received an update, we now need to quickly snapshot the
+        //! difference between the recieved clock and this player, along with
+        //! when the snapeshot took place
+        // if received_time_index:
+          //! store the time we received it, based on the current player position
+          // time_of_reception = m_av_clock->OMXMediaTime()
+          //! we now store the offset between the player and the received clock,
+          //! while considering the added offset from the command line
+          // current_offset = received_time_index - time_of_reception - offset_from_command_line
+          //! positive means we're ahead, negative means we're behind
+          
+        //! if our current offset is large... say over 2 seconds, we just jump the
+        //! player to the correct position and set its playback speed to normal
+        // if abs(current_offset) > 2:
+          // if the_player_can_seek():   # m_omx_reader.CanSeek()
+            // seek_amount = -current_offset       # m_incr = 600.0;
+            // player_to_normal_speed()
+            // SyncCurSpeed = 0  # noting the above action for just below
+          //! if we can't seek, pause the player if we're ahead
+          // elif current_offset > 0:
+            // pause_the_player()
+            // SyncCurSpeed = -1   # note this as slow speed for the following process
+          //! or speed it up if we're behind
+          // else:
+            // player_to_fast_speed()
+            // SyncCurSpeed = 1
+        
+        }
+      
+      if(SyncCurSpeed != 0) {
+      //! If the current speed is not normal, then we are converging to sync.
+      //! We do this every time around the loop, even when no packets are
+      //! received.  We will dead-reckon the time that the master player should
+      //! be at.
+        
+        //! grab the player position at this moment
+        // right_now = m_av_clock->OMXMediaTime()  # the current player position
+        //! find the time past since the last "time_of_reception" (which may be dead reckoned)
+        // delta_time = right_now - time_of_reception
+        //! If the player is going fast, then the offset time will move in the positive
+        //! direction based on the delta_time, negative direction if the player is
+        //! going slower.
+        // if SyncCurSpeed == 1:
+          // current_offset += int(delta_time * (1.125 - 1))
+        //! SyncCurSpeed is -1 because it's [-1,0,1], thus can only be that at this point
+        // elif the_player_can_seek():
+          // current offset -= int(delta_time * (1 - 0.975))
+        // else:
+          // current offset -= delta_time  # player would be paused if it can't seek
+        //! Store the "time_of_reception" as being the "right_now" time because
+        //! we adjusted the "current_offset", thus dead reckoning where the master
+        //! should be right now.  It will be overwritten if we do receive a packet
+        //! next time around.
+        // time_of_reception = right_now
+        
+        //! now we need to decide if to return to normal speed
+        //! if the speed is fast, but the offset is nearly positive, then drop to normal speed
+        // if (current_offset > -0.01) and (SyncCurSpeed == 1):
+          // player_to_normal_speed()
+          // SyncCurSpeed == 0
+        //! if the speed is low (or paused) and the offset is nearly negative...
+        // if (current_offset < 0.01) and (SyncCurSpeed == -1):
+          // if the_player_can_seek():
+            // player_to_normal_speed()
+          // else:
+            // unpause_the_player()
+          // SyncCurSpeed == 0
+        
+      } else {
+      //! If the current speed is normal, then we need to decide whether to change
+      //! the speed based on the current_offset.
+        // if (current_offset < -0.05):  # will need to experiment for this threshhold
+          // player_to_fast_speed()
+          // SyncCurSpeed = 1
+        // if the_player_can_seek():
+          // if (current_offset > 0.05):
+            // player_to_slow_speed()
+            // SyncCurSpeed = -1
+        // else:
+          //! if the player cannot seek, then the only way we have to adjust it is pausing it
+          // if (current_offset > 0.2):
+            // pause_the_player()
+            // SyncCurSpeed = -1
+      }
+    }
+    
     if(m_omx_reader.IsEof() && !m_omx_pkt)
     {
       if (!m_player_audio.GetCached() && !m_player_video.GetCached())
@@ -1208,7 +1459,11 @@ do_exit:
 
   g_OMX.Deinitialize();
   g_RBP.Deinitialize();
-
+  
+  if(SyncSocketFD) {  // LHSG
+    close(SyncSocketFD);
+  }
+  
   printf("have a nice day ;)\n");
   return 1;
 }
